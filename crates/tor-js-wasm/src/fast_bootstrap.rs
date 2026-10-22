@@ -682,7 +682,7 @@ mod zip_tests {
             let last = chunks.peek().is_none() as u32;
             // block_header = last_block | (block_type << 1) | (size << 3),
             // block_type 0 = Raw.
-            let header = last | (0 << 1) | ((chunk.len() as u32) << 3);
+            let header = last | ((chunk.len() as u32) << 3);
             out.extend_from_slice(&header.to_le_bytes()[..3]);
             out.extend_from_slice(chunk);
         }

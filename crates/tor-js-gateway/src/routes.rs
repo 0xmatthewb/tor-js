@@ -271,10 +271,10 @@ async fn handle_bootstrap_zip_zst(
     headers: HeaderMap,
 ) -> Response {
     let etag = read_etag(&gw.data_dir).await;
-    if let Some(ref etag) = etag {
-        if let Some(not_modified) = check_not_modified(&headers, etag) {
-            return not_modified;
-        }
+    if let Some(ref etag) = etag
+        && let Some(not_modified) = check_not_modified(&headers, etag)
+    {
+        return not_modified;
     }
     let data = match tokio::fs::read(gw.data_dir.join("bootstrap.zip.zst")).await {
         Ok(d) => d,

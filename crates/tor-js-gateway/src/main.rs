@@ -170,10 +170,10 @@ fn advertised_addresses(
     if let Some(ip) = detect_source_ip(false) {
         out.push(listener.address(&ip.to_string()));
     }
-    if has_ipv6 {
-        if let Some(ip) = detect_source_ip(true) {
-            out.push(listener.address(&ip.to_string()));
-        }
+    if has_ipv6
+        && let Some(ip) = detect_source_ip(true)
+    {
+        out.push(listener.address(&ip.to_string()));
     }
     if out.is_empty() {
         tracing::warn!("could not detect a public IP; set advertised_addresses in the config");
@@ -197,20 +197,17 @@ fn preload_allowlist(data_dir: &std::path::Path, allowlist: &tunnel::RelayAllowl
             if parts.len() >= 6 {
                 if let (Ok(ip), Ok(port)) =
                     (parts[4].parse::<std::net::IpAddr>(), parts[5].parse::<u16>())
+                    && port != 0
                 {
-                    if port != 0 {
-                        addrs.insert(std::net::SocketAddr::new(ip, port));
-                    }
+                    addrs.insert(std::net::SocketAddr::new(ip, port));
                 }
                 // DirPort
-                if parts.len() >= 7 {
-                    if let Ok(dport) = parts[6].parse::<u16>() {
-                        if dport != 0 {
-                            if let Ok(ip) = parts[4].parse::<std::net::IpAddr>() {
-                                addrs.insert(std::net::SocketAddr::new(ip, dport));
-                            }
-                        }
-                    }
+                if parts.len() >= 7
+                    && let Ok(dport) = parts[6].parse::<u16>()
+                    && dport != 0
+                    && let Ok(ip) = parts[4].parse::<std::net::IpAddr>()
+                {
+                    addrs.insert(std::net::SocketAddr::new(ip, dport));
                 }
             }
         }
