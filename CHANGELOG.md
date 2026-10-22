@@ -11,7 +11,8 @@ pin changes too.
   client opened could share circuits, so requests made seconds apart left the
   same exit and whoever answered them could link them. Requests with different
   `isolationKey`s now never share a circuit (each key is its own arti isolation
-  group); requests with the same key may. Use one key per identity a caller
+  group) or a resumed TLS session; requests with the same key may share a
+  circuit. Use one key per identity a caller
   needs kept apart, such as a wallet account, or a fresh random key per request.
   Omitting it keeps the old behaviour. An empty or over-256-byte key is
   rejected with `INVALID_OPTIONS`.

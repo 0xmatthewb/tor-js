@@ -128,6 +128,8 @@ await client.fetch(rpcUrl, { method: 'POST', body: b, isolationKey: 'account-2' 
 ```
 
 The key is an opaque label (at most 256 bytes) that never leaves the client.
+A request with a key also never resumes a TLS session, so a server cannot link
+keys by a session ticket.
 Isolation costs circuits: each new key builds its own, so prefer one key per
 identity over one per request unless the requests themselves must be unlinkable.
 Through the anon-rpc worker, pass `isolationKey` in the init of the host's
