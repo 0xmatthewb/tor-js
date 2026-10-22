@@ -42,7 +42,7 @@ ruzstd = "0.8"
 # TLS for HTTPS over DataStream (rustls with pure-Rust crypto for WASM)
 futures-rustls = { version = "0.26", default-features = false, features = ["tls12", "logging"] }
 rustls-rustcrypto = "0.0.2-alpha"
-webpki-roots = "1"
+webpki-roots = "1.0.10"
 rustls-pki-types = { version = "1", features = ["web"] }
 
 # HTTP support
