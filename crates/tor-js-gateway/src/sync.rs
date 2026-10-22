@@ -109,7 +109,7 @@ pub async fn sync_once(
     let (_signed, _remainder, unchecked) =
         MdConsensus::parse(&consensus_text).context("parsing consensus")?;
     let unvalidated = unchecked
-        .check_valid_at(&now)
+        .if_valid_at(&now)
         .map_err(|e: TimeValidityError| anyhow::anyhow!("consensus not timely: {}", e))?
         .set_n_authorities(authority_ids.len());
 

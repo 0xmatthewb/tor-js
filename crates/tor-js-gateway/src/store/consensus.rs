@@ -123,8 +123,13 @@ impl ConsensusStore {
                 response.len(),
                 old_text.len(),
             );
-            let result = tor_consdiff::apply_diff(old_text, &response, None)
-                .context("applying consensus diff")?;
+            let result = tor_consdiff::apply_diff(
+                old_text,
+                &response,
+                None,
+                tor_consdiff::DiffSizeStrictness::Apply,
+            )
+            .context("applying consensus diff")?;
             result
                 .check_digest()
                 .context("consensus diff digest mismatch")?;

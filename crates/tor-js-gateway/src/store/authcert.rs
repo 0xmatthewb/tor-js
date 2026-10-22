@@ -103,7 +103,7 @@ fn parse_and_validate_certs(text: &str, now: &SystemTime) -> Vec<AuthCert> {
     let mut certs = Vec::new();
     for unchecked in iter.flatten() {
         if let Ok(timebound) = unchecked.check_signature()
-            && let Ok(cert) = timebound.check_valid_at(now)
+            && let Ok(cert) = timebound.if_valid_at(now)
             && trusted_ids.contains(cert.id_fingerprint())
         {
             certs.push(cert);
