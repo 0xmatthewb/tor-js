@@ -183,19 +183,27 @@ describe('toFetchInit', () => {
     assert.deepEqual((await toFetchInit({ headers: [] })).headers, {})
   })
 
-  test('the isolation header becomes isolationKey and is never forwarded', async () => {
+  test('an isolationKey in the init becomes isolationKey', async () => {
     const out = await toFetchInit({
-      headers: [
-        ['content-type', 'application/json'],
-        ['X-Anon-Rpc-Isolation', 'account-7'],
-      ],
+      headers: [['content-type', 'application/json']],
+      isolationKey: 'account-7',
     })
     assert.equal(out.isolationKey, 'account-7')
     assert.deepEqual(out.headers, { 'content-type': 'application/json' })
   })
 
-  test('no isolation header leaves isolationKey unset', async () => {
+  test('no isolationKey leaves isolationKey unset', async () => {
     const out = await toFetchInit({ headers: [['content-type', 'application/json']] })
+    assert.equal('isolationKey' in out, false)
+  })
+
+  test('an isolationKey that is not a string fails the call', async () => {
+    await assert.rejects(toFetchInit({ isolationKey: 7 }), TypeError)
+  })
+
+  test('a request header is forwarded whatever its name', async () => {
+    const out = await toFetchInit({ headers: [['x-anon-rpc-isolation', 'account-7']] })
+    assert.deepEqual(out.headers, { 'x-anon-rpc-isolation': 'account-7' })
     assert.equal('isolationKey' in out, false)
   })
 

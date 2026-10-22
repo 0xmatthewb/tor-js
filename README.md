@@ -130,8 +130,11 @@ await client.fetch(rpcUrl, { method: 'POST', body: b, isolationKey: 'account-2' 
 The key is an opaque label (at most 256 bytes) that never leaves the client.
 Isolation costs circuits: each new key builds its own, so prefer one key per
 identity over one per request unless the requests themselves must be unlinkable.
-Through the anon-rpc worker, set the `x-anon-rpc-isolation` request header; the
-worker consumes it as `isolationKey` and does not forward it.
+Through the anon-rpc worker, pass `isolationKey` in the init of the host's
+`fetch` (`worker.fetch(rpcUrl, { method: 'POST', body, isolationKey })`). The
+worker reads it from the call's request init, so it needs a harness that
+forwards `init` members the anon-rpc spec does not name; a harness that drops
+them sends every call without a key.
 
 ### `client.ready()`
 

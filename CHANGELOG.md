@@ -15,11 +15,10 @@ too.
   needs kept apart, such as a wallet account, or a fresh random key per request.
   Omitting it keeps the old behaviour. An empty or over-256-byte key is
   rejected with `INVALID_OPTIONS`.
-- **anon-rpc worker: `x-anon-rpc-isolation` request header.** The anon-rpc
-  spec's request init has no isolation field, and headers already pass through
-  every harness unchanged, so a host sets this header and the worker turns it
-  into `isolationKey`. The header is consumed, never forwarded to the
-  destination.
+- **anon-rpc worker: `isolationKey` from the call's request init.** A host
+  passes `isolationKey` in the init of its anon-rpc `fetch`, and a harness that
+  forwards `init` members the spec does not name delivers it to the worker,
+  which passes it to `fetch`. A key that is not a string fails the call.
 
 ## 0.4.3
 
