@@ -306,7 +306,7 @@ impl Config {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let content = Self::to_json5_with_comments();
-        std::fs::write(&path, &content)
+        std::fs::write(path, &content)
             .with_context(|| format!("writing {}", path.display()))?;
         println!("Created config at {}", path.display());
         Ok(())
