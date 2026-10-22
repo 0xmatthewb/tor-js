@@ -110,6 +110,26 @@ export function resolveLogLevel(config: unknown): LogLevel {
   return v as LogLevel;
 }
 
+// The optional `bootstrap` in the object form of WorkerInit.config: a
+// directory snapshot in the gateway's `/bootstrap.zip.zst` format, which the
+// host fetched from a mirror (TorClientOptions.bootstrap). The harness
+// delivers config by structured clone, so the bytes arrive as a Uint8Array or
+// an ArrayBuffer. Anything else is a config error, as for `logLevel`.
+export function resolveBootstrap(config: unknown): Uint8Array | undefined {
+  const v = (config as { bootstrap?: unknown } | null)?.bootstrap;
+  if (v === undefined || typeof config !== "object" || Array.isArray(config)) {
+    return undefined;
+  }
+  const bytes = v instanceof Uint8Array ? v : v instanceof ArrayBuffer ? new Uint8Array(v) : null;
+  if (!bytes || bytes.byteLength === 0) {
+    throw new Error(
+      "tor-js worker: invalid bootstrap in WorkerInit.config; expected the non-empty bytes of a " +
+      "/bootstrap.zip.zst snapshot as a Uint8Array or ArrayBuffer.",
+    );
+  }
+  return bytes;
+}
+
 // A `rawLog` for tor-js's `Log` that forwards to the host's LogApi, dropping
 // entries below `level`. That filter covers tor-js's own JS-side lines; arti's
 // are already filtered at the source by TorClient's `logLevel`.
