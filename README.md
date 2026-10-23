@@ -64,6 +64,7 @@ type TorClientOptions = {
   storage?: TorStorage;                // Persistent storage (default: auto-detected)
   logLevel?: LogLevel;                 // 'trace' | 'debug' | 'info' | 'warn' | 'error'
   socketProvider?: ArtiSocketProvider; // Custom transport (overrides `gateway`)
+  bootstrap?: Uint8Array;              // Fast-bootstrap snapshot to use instead of the gateway's
 };
 ```
 
@@ -144,6 +145,8 @@ Close the client and release resources. Also available as `Symbol.dispose` for u
 Browsers can't open raw TCP sockets, so to reach Tor relays from a browser you connect through a **gateway** — a small server that proxies relay connections and serves a fast-bootstrap snapshot of the Tor directory. (In Node.js/Deno tor-js opens TCP directly, so a gateway is optional there — used only for fast bootstrap.)
 
 The client dials the gateway by its **KPS address**, `ip:port:certhash` (printed by the gateway at startup), over [KPS](https://ethereum.github.io/kps/) — WebRTC in browsers, QUIC in Node.js. Each Tor relay connection is an HTTP `CONNECT` tunnel on its own KPS stream; fast bootstrap is a zstd-compressed directory snapshot fetched over the same connection. The full wire protocol is specified in [PROTOCOL.md](PROTOCOL.md).
+
+The snapshot is the same public directory data for every client, so an app can also serve it itself: fetch `/bootstrap.zip.zst` from a mirror, such as a copy on the app's origin refreshed from a gateway, and pass the bytes as `bootstrap`. The client checks it as it checks one from a gateway, and uses it only while its storage holds no consensus. The anon-rpc worker reads the same bytes from `config.bootstrap`.
 
 The gateway lives in this repo at [`crates/tor-js-gateway/`](crates/tor-js-gateway/) — see [its README](crates/tor-js-gateway/README.md) to build and run your own. The [live demo](https://ethereum.github.io/tor-js/demo.html) uses a public gateway that is for demonstration only (limited capacity, may disappear at any time); host your own for anything real.
 

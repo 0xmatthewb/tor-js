@@ -389,6 +389,27 @@ describe('TorClient', () => {
       client.close()
     })
 
+    test('a supplied snapshot is used in place of the gateway archive', async () => {
+      let fetched = 0
+      const provider = fakeProvider({
+        gateway: { address: 'x' },
+        gatewayFetch: async () => { fetched++; return { status: 200, statusText: 'OK', body: new Uint8Array([1]) } },
+      })
+      const snapshot = new Uint8Array([7, 8, 9])
+      const client = makeClient({ socketProvider: provider, bootstrap: snapshot })
+      await client.ready()
+      assert.equal(await stub.options.at(-1).fastBootstrap(), snapshot)
+      assert.equal(fetched, 0, 'the gateway archive is not fetched')
+      client.close()
+    })
+
+    test('a supplied snapshot needs no gateway', async () => {
+      const client = makeClient({ socketProvider: fakeProvider({ gateway: null }), bootstrap: new Uint8Array([7]) })
+      await client.ready()
+      assert.deepEqual(await stub.options.at(-1).fastBootstrap(), new Uint8Array([7]))
+      client.close()
+    })
+
     test('a provider that cannot reach any gateway propagates', async () => {
       const provider = fakeProvider({
         gateway: { address: 'x' },

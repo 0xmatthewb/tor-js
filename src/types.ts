@@ -44,6 +44,15 @@ export type TorClientOptions = {
 
   /** Optional custom socket provider. When set, overrides the default ArtiSocketProvider created from the gateway address. */
   socketProvider?: ArtiSocketProvider;
+
+  /**
+   * A directory snapshot in the format a gateway serves at
+   * `/bootstrap.zip.zst`, used for fast bootstrap in place of fetching one
+   * from the gateway. Lets an app serve the snapshot from a mirror it already
+   * talks to, such as the app's origin. The snapshot is checked as one from a
+   * gateway is, and only used while storage holds no consensus.
+   */
+  bootstrap?: Uint8Array;
 };
 
 export type { TorStorage } from '#wasm';

@@ -25,6 +25,7 @@ import {
   errMsg,
   hostRawLog,
   makeTorStorage,
+  resolveBootstrap,
   resolveGateways,
   resolveLogLevel,
   sleep,
@@ -67,6 +68,7 @@ const dial: DialFn = async (addr) => {
       storage: makeTorStorage(storage),
       log,
       logLevel,
+      bootstrap: resolveBootstrap(anonRpcWorker.config),
     });
   } catch (e) {
     anonRpcWorker.signalFailed({ message: errMsg(e) });

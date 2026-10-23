@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { bundleTs } from './bundle.mjs'
 
 let bootstrapBackoff, resolveGateways, toFetchInit, errMsg, makeTorStorage
-let resolveLogLevel, hostRawLog, toLogArg, DEFAULT_LOG_LEVEL
+let resolveLogLevel, resolveBootstrap, hostRawLog, toLogArg, DEFAULT_LOG_LEVEL
 let BOOTSTRAP_RETRY_BASE_MS, BOOTSTRAP_RETRY_MAX_MS
 
 before(async () => {
@@ -25,6 +25,7 @@ before(async () => {
     errMsg,
     makeTorStorage,
     resolveLogLevel,
+    resolveBootstrap,
     hostRawLog,
     toLogArg,
     DEFAULT_LOG_LEVEL,
@@ -319,6 +320,26 @@ describe('resolveLogLevel', () => {
   test('refuses an unrecognised level rather than guessing', () => {
     for (const logLevel of ['verbose', 'INFO', 3, null, '']) {
       assert.throws(() => resolveLogLevel({ gateways: [ADDR], logLevel }), /invalid logLevel/)
+    }
+  })
+})
+
+describe('resolveBootstrap', () => {
+  test('is absent unless the object form names one', () => {
+    for (const config of [undefined, null, ADDR, [ADDR], { gateways: [ADDR] }]) {
+      assert.equal(resolveBootstrap(config), undefined, JSON.stringify(config))
+    }
+  })
+
+  test('reads the snapshot bytes from the object form', () => {
+    const bytes = new Uint8Array([1, 2, 3])
+    assert.equal(resolveBootstrap({ gateways: [ADDR], bootstrap: bytes }), bytes)
+    assert.deepEqual(resolveBootstrap({ gateways: [ADDR], bootstrap: bytes.buffer }), bytes)
+  })
+
+  test('refuses anything but non-empty bytes', () => {
+    for (const bootstrap of ['https://example.com/bootstrap.zip.zst', [1, 2], null, 0, new Uint8Array(0), new ArrayBuffer(0)]) {
+      assert.throws(() => resolveBootstrap({ gateways: [ADDR], bootstrap }), /invalid bootstrap/)
     }
   })
 })
