@@ -539,25 +539,25 @@ async fn fetch_impl(
 
     info!("Fetching {} via Tor ({}:{})", url, host, port);
 
-    // Check abort before connecting (circuit building can take several seconds)
-    check_aborted(signal.as_ref())?;
-
-    // Connect through Tor
+    // Connect through Tor (circuit building can take several seconds)
     debug!("Connecting to {}:{}...", host, port);
-    let stream = client
-        .connect((host, port))
-        .await
-        .map_err(|e| JsTorError::connection(format!("Failed to connect: {}", e)).into_js_value())?;
-
-    // Check abort before sending the HTTP request
-    check_aborted(signal.as_ref())?;
+    let stream = abortable(signal.as_ref(), async {
+        client
+            .connect((host, port))
+            .await
+            .map_err(|e| JsTorError::connection(format!("Failed to connect: {}", e)).into_js_value())
+    })
+    .await?;
 
     debug!("Connected, making HTTP request...");
 
     // Perform the HTTP request — resolves as soon as headers arrive
-    let result = fetch::fetch_headers(stream, &url, method, headers, request_body, is_https, host, Some(tls_config))
-        .await
-        .map_err(|e| e.into_js_value())?;
+    let result = abortable(signal.as_ref(), async {
+        fetch::fetch_headers(stream, &url, method, headers, request_body, is_https, host, Some(tls_config))
+            .await
+            .map_err(|e| e.into_js_value())
+    })
+    .await?;
 
     // Build web_sys::Headers from the parsed headers
     let js_headers = web_sys::Headers::new()
@@ -568,20 +568,16 @@ async fn fetch_impl(
     }
 
     // Convert BodyReader → futures::Stream → JS ReadableStream
-    // The signal is threaded through the unfold state so abort is checked between chunks.
+    // The signal is threaded through the unfold state so abort interrupts each chunk read.
     let body_stream = futures::stream::unfold((result.body_reader, signal), |(mut reader, sig)| async move {
-        if let Some(s) = &sig {
-            if s.aborted() {
-                return Some((Err(JsTorError::aborted().into_js_value()), (reader, sig)));
-            }
-        }
-        match reader.read_chunk().await {
+        let chunk = abortable(sig.as_ref(), async { reader.read_chunk().await.map_err(|e| e.into_js_value()) }).await;
+        match chunk {
             Ok(Some(chunk)) => {
                 let arr = js_sys::Uint8Array::from(&chunk[..]);
                 Some((Ok(arr.into()), (reader, sig)))
             }
             Ok(None) => None,
-            Err(e) => Some((Err(e.into_js_value()), (reader, sig))),
+            Err(e) => Some((Err(e), (reader, sig))),
         }
     });
     let readable = wasm_streams::ReadableStream::from_stream(body_stream);
@@ -681,6 +677,52 @@ fn check_aborted(signal: Option<&web_sys::AbortSignal>) -> Result<(), JsValue> {
         }
     }
     Ok(())
+}
+
+/// Run `fut` unless `signal` aborts first, in which case `fut` is dropped
+/// (closing whatever stream it owns) and an abort error is returned.
+async fn abortable<T>(
+    signal: Option<&web_sys::AbortSignal>,
+    fut: impl std::future::Future<Output = Result<T, JsValue>>,
+) -> Result<T, JsValue> {
+    let Some(signal) = signal else {
+        return fut.await;
+    };
+    check_aborted(Some(signal))?;
+
+    let (tx, rx) = futures::channel::oneshot::channel::<()>();
+    let _listener = AbortListener::new(signal, Closure::once(move || {
+        let _ = tx.send(());
+    }))?;
+
+    // Poll `rx` first so an abort wins over I/O that completes in the same wakeup.
+    futures::pin_mut!(fut);
+    match futures::future::select(rx, fut).await {
+        futures::future::Either::Left(_) => Err(JsTorError::aborted().into_js_value()),
+        futures::future::Either::Right((result, _)) => result,
+    }
+}
+
+/// An `abort` listener that unregisters itself before its closure is freed,
+/// including when the future holding it is dropped mid-await.
+struct AbortListener<'a> {
+    signal: &'a web_sys::AbortSignal,
+    callback: Closure<dyn FnMut()>,
+}
+
+impl<'a> AbortListener<'a> {
+    fn new(signal: &'a web_sys::AbortSignal, callback: Closure<dyn FnMut()>) -> Result<Self, JsValue> {
+        signal.add_event_listener_with_callback("abort", callback.as_ref().unchecked_ref())?;
+        Ok(Self { signal, callback })
+    }
+}
+
+impl Drop for AbortListener<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .signal
+            .remove_event_listener_with_callback("abort", self.callback.as_ref().unchecked_ref());
+    }
 }
 
 // ============================================================================
