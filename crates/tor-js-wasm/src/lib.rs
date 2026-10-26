@@ -50,8 +50,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use arti_client::config::CfgPath;
-use arti_client::{DataStream, HasKind, StreamPrefs, TorClient as ArtiTorClient, TorClientConfig};
-use isolation::{Group, IsolationGroups, KeyError, MAX_KEY_LEN};
+use arti_client::{DataStream, StreamPrefs, TorClient as ArtiTorClient, TorClientConfig};
+use isolation::{ConnectError, Group, IsolationGroups, KeyError, MAX_KEY_LEN};
 use serde::Deserialize;
 use crate::runtime::WasmRuntime;
 use tracing::{debug, info, error};
@@ -680,16 +680,8 @@ fn extract_body_from_js(init: &JsValue) -> Result<fetch::RequestBody, JsValue> {
     .into_js_value())
 }
 
-/// Open a stream to `host:port` on a circuit of `group`.
-///
-/// Arti keeps giving out a circuit after a stream failed to open on it, until
-/// the circuit expires (ten minutes after first use for a shared one), so one
-/// bad exit can fail every request in a group for that long. Each time the far
-/// end fails to open the stream, move the group to a fresh token, so requests
-/// that start later get another circuit, and try once more after the first
-/// failure. This approximates C tor's `mark_circuit_unusable_for_new_conns`:
-/// requests that already hold the old token can still reach the old circuit,
-/// which expires on its own schedule.
+/// Open a stream to `host:port` on a circuit of `group`, retrying once on a
+/// fresh circuit after an exit-side failure (see [`isolation::connect_in_group`]).
 async fn connect_in_group(
     client: &ArtiTorClient<WasmRuntime>,
     host: &str,
@@ -702,51 +694,16 @@ async fn connect_in_group(
         prefs.set_isolation(token);
         async move { client.connect_with_prefs((host, port), &prefs).await }
     };
-    let failed = |e: arti_client::Error| {
-        JsTorError::connection(format!("Failed to connect: {}", error::with_sources(&e)))
-            .into_js_value()
-    };
-
-    let mut retried = false;
-    loop {
-        match connect(group.token()).await {
-            Err(e) if exit_failed(e.kind()) => {
-                group.move_to_fresh_token();
-                if retried {
-                    return Err(failed(e));
-                }
-                info!(
-                    "Exit failed to open a stream ({}); retrying on a fresh circuit",
-                    error::with_sources(&e)
-                );
-                check_aborted(signal)?;
-                retried = true;
+    let aborted = || signal.is_some_and(|s| s.aborted());
+    isolation::connect_in_group(group, connect, aborted)
+        .await
+        .map_err(|e| match e {
+            ConnectError::Failed(e) => {
+                JsTorError::connection(format!("Failed to connect: {}", error::with_sources(&e)))
+                    .into_js_value()
             }
-            result => return result.map_err(failed),
-        }
-    }
-}
-
-/// Whether an error of `kind` says the far end of the circuit failed to open
-/// a stream: it timed out (an exit, or an onion service's rendezvous), or the
-/// exit answered with an END reason that C tor retries on another circuit. A
-/// refused connection is the destination's answer, not the exit's, so it is
-/// not retried.
-fn exit_failed(kind: arti_client::ErrorKind) -> bool {
-    use arti_client::ErrorKind as EK;
-    matches!(
-        kind,
-        // Arti's own connect timeout; it reports this kind, not `ExitTimeout`.
-        EK::RemoteNetworkTimeout
-            // END reasons TIMEOUT, MISC, RESOLVEFAILED, NOROUTE, EXITPOLICY,
-            // and HIBERNATING or RESOURCELIMIT.
-            | EK::ExitTimeout
-            | EK::RemoteStreamError
-            | EK::RemoteHostResolutionFailed
-            | EK::RemoteNetworkFailed
-            | EK::ExitPolicyRejected
-            | EK::RelayTooBusy
-    )
+            ConnectError::Aborted => JsTorError::aborted().into_js_value(),
+        })
 }
 
 /// Read `anonOptions.isolationKey` from a JavaScript FetchInit object, if present.
@@ -920,18 +877,3 @@ export interface TorClientOptions {
     withStorage(storage: TorStorage): TorClientOptions;
 }
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arti_client::ErrorKind as EK;
-
-    #[test]
-    fn exit_side_failures_are_retried_and_refusals_are_not() {
-        // Arti's connect timeout reports RemoteNetworkTimeout, not ExitTimeout.
-        assert!(exit_failed(EK::RemoteNetworkTimeout));
-        assert!(exit_failed(EK::RemoteStreamError));
-        assert!(!exit_failed(EK::RemoteConnectionRefused));
-        assert!(!exit_failed(EK::TorNetworkTimeout));
-    }
-}

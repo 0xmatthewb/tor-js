@@ -12,13 +12,15 @@
 //!
 //! A group can also move to a fresh token. Arti keeps handing out a circuit
 //! whose exit failed to open a stream until the circuit expires, so `fetch`
-//! moves the group off it after such a failure (see `connect_in_group`).
+//! moves the group off it after such a failure (see [`connect_in_group`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::rc::Rc;
 
-use arti_client::IsolationToken;
+use arti_client::{ErrorKind, HasKind, IsolationToken};
+use tracing::info;
 
 /// Longest accepted key. Keys are labels, not payloads.
 pub(crate) const MAX_KEY_LEN: usize = 256;
@@ -147,6 +149,75 @@ impl Group {
     }
 }
 
+/// Why [`connect_in_group`] gave up.
+pub(crate) enum ConnectError<E> {
+    Failed(E),
+    Aborted,
+}
+
+/// Open a stream with `connect` on a circuit of `group`.
+///
+/// Arti keeps giving out a circuit after a stream failed to open on it, until
+/// the circuit expires (ten minutes after first use for a shared one), so one
+/// bad exit can fail every request in a group for that long. Each time the far
+/// end fails to open the stream, move the group to a fresh token, so requests
+/// that start later get another circuit, and try once more after the first
+/// failure unless `aborted`. This approximates C tor's
+/// `mark_circuit_unusable_for_new_conns`: requests that already hold the old
+/// token can still reach the old circuit, which expires on its own schedule.
+pub(crate) async fn connect_in_group<T, E, Fut>(
+    group: &mut Group,
+    mut connect: impl FnMut(IsolationToken) -> Fut,
+    aborted: impl Fn() -> bool,
+) -> Result<T, ConnectError<E>>
+where
+    E: HasKind + std::error::Error,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut retried = false;
+    loop {
+        match connect(group.token()).await {
+            Err(e) if exit_failed(e.kind()) => {
+                group.move_to_fresh_token();
+                if retried {
+                    return Err(ConnectError::Failed(e));
+                }
+                info!(
+                    "Exit failed to open a stream ({}); retrying on a fresh circuit",
+                    crate::error::with_sources(&e)
+                );
+                if aborted() {
+                    return Err(ConnectError::Aborted);
+                }
+                retried = true;
+            }
+            result => return result.map_err(ConnectError::Failed),
+        }
+    }
+}
+
+/// Whether an error of `kind` says the far end of the circuit failed to open
+/// a stream: it timed out (an exit, or an onion service's rendezvous), or the
+/// exit answered with an END reason that C tor retries on another circuit. A
+/// refused connection is the destination's answer, not the exit's, so it is
+/// not retried.
+fn exit_failed(kind: ErrorKind) -> bool {
+    use ErrorKind as EK;
+    matches!(
+        kind,
+        // Arti's own connect timeout; it reports this kind, not `ExitTimeout`.
+        EK::RemoteNetworkTimeout
+            // END reasons TIMEOUT, MISC, RESOLVEFAILED, NOROUTE, EXITPOLICY,
+            // and HIBERNATING or RESOURCELIMIT.
+            | EK::ExitTimeout
+            | EK::RemoteStreamError
+            | EK::RemoteHostResolutionFailed
+            | EK::RemoteNetworkFailed
+            | EK::ExitPolicyRejected
+            | EK::RelayTooBusy
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +316,107 @@ mod tests {
             Group::new(&groups, Some(String::new())),
             Err(KeyError::Empty)
         ));
+    }
+
+    #[derive(Debug)]
+    struct Failure(ErrorKind);
+
+    impl std::fmt::Display for Failure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for Failure {}
+
+    impl HasKind for Failure {
+        fn kind(&self) -> ErrorKind {
+            self.0
+        }
+    }
+
+    /// Run `connect_in_group` on the unkeyed group, with each attempt taking
+    /// the next of `outcomes`. Returns the tokens the attempts used, the
+    /// result, and the group's token afterwards.
+    fn run(
+        outcomes: Vec<Result<(), ErrorKind>>,
+        aborted: bool,
+    ) -> (
+        Vec<IsolationToken>,
+        Result<(), ConnectError<Failure>>,
+        IsolationToken,
+    ) {
+        let groups = Rc::new(RefCell::new(IsolationGroups::default()));
+        let mut group = Group::new(&groups, None).unwrap();
+        let mut outcomes = outcomes.into_iter();
+        let mut used = Vec::new();
+        let result = futures::executor::block_on(connect_in_group(
+            &mut group,
+            |token| {
+                used.push(token);
+                let outcome = outcomes.next().expect("no attempt left").map_err(Failure);
+                async move { outcome }
+            },
+            || aborted,
+        ));
+        let after = groups.borrow().unkeyed();
+        (used, result, after)
+    }
+
+    #[test]
+    fn a_success_keeps_the_group() {
+        let (used, result, after) = run(vec![Ok(())], false);
+        assert!(result.is_ok());
+        assert_eq!(used, [after]);
+    }
+
+    #[test]
+    fn an_exit_failure_retries_once_on_a_fresh_token() {
+        let (used, result, after) = run(vec![Err(ErrorKind::RemoteNetworkTimeout), Ok(())], false);
+        assert!(result.is_ok());
+        assert_eq!(used.len(), 2);
+        assert_ne!(used[0], used[1]);
+        assert_eq!(used[1], after);
+    }
+
+    #[test]
+    fn a_failed_retry_moves_the_group_again_without_a_third_attempt() {
+        let (used, result, after) = run(
+            vec![
+                Err(ErrorKind::RemoteStreamError),
+                Err(ErrorKind::RemoteNetworkTimeout),
+            ],
+            false,
+        );
+        assert!(matches!(
+            result,
+            Err(ConnectError::Failed(Failure(
+                ErrorKind::RemoteNetworkTimeout
+            )))
+        ));
+        assert_eq!(used.len(), 2);
+        assert!(!used.contains(&after));
+    }
+
+    #[test]
+    fn a_refusal_is_returned_without_a_retry() {
+        let (used, result, after) = run(vec![Err(ErrorKind::RemoteConnectionRefused)], false);
+        assert!(matches!(result, Err(ConnectError::Failed(_))));
+        assert_eq!(used, [after]);
+    }
+
+    #[test]
+    fn a_failure_to_obtain_a_circuit_is_returned_without_a_retry() {
+        let (used, result, after) = run(vec![Err(ErrorKind::TorNetworkTimeout)], false);
+        assert!(matches!(result, Err(ConnectError::Failed(_))));
+        assert_eq!(used, [after]);
+    }
+
+    #[test]
+    fn an_abort_stops_the_retry_but_still_moves_the_group() {
+        let (used, result, after) = run(vec![Err(ErrorKind::RemoteNetworkTimeout)], true);
+        assert!(matches!(result, Err(ConnectError::Aborted)));
+        assert_eq!(used.len(), 1);
+        assert_ne!(used[0], after);
     }
 }
