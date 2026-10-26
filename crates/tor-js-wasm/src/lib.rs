@@ -696,11 +696,22 @@ async fn abortable<T>(
         let _ = tx.send(());
     }))?;
 
-    // Poll `rx` first so an abort wins over I/O that completes in the same wakeup.
-    futures::pin_mut!(fut);
-    match futures::future::select(rx, fut).await {
-        futures::future::Either::Left(_) => Err(JsTorError::aborted().into_js_value()),
-        futures::future::Either::Right((result, _)) => result,
+    unless_aborted(rx, fut)
+        .await
+        .unwrap_or_else(|| Err(JsTorError::aborted().into_js_value()))
+}
+
+/// Run `fut` unless `abort` resolves first, in which case `fut` is dropped and
+/// `None` is returned. `abort` is polled first, so an abort wins over I/O that
+/// completes in the same wakeup.
+async fn unless_aborted<F: std::future::Future>(
+    abort: impl std::future::Future,
+    fut: F,
+) -> Option<F::Output> {
+    futures::pin_mut!(abort, fut);
+    match futures::future::select(abort, fut).await {
+        futures::future::Either::Left(_) => None,
+        futures::future::Either::Right((output, _)) => Some(output),
     }
 }
 
@@ -841,3 +852,51 @@ export interface TorClientOptions {
     withStorage(storage: TorStorage): TorClientOptions;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::unless_aborted;
+    use futures::channel::oneshot;
+    use futures::executor::block_on;
+    use futures::future::{pending, ready};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A future that never completes and records when it is dropped.
+    fn pending_until_dropped(dropped: Rc<Cell<bool>>) -> impl std::future::Future<Output = u8> {
+        struct OnDrop(Rc<Cell<bool>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let guard = OnDrop(dropped);
+        async move {
+            let _guard = guard;
+            pending().await
+        }
+    }
+
+    #[test]
+    fn the_operation_completes_when_no_abort_comes() {
+        assert_eq!(block_on(unless_aborted(pending::<()>(), ready(7))), Some(7));
+    }
+
+    #[test]
+    fn an_abort_ends_the_wait_and_drops_the_operation() {
+        let dropped = Rc::new(Cell::new(false));
+        let (tx, rx) = oneshot::channel::<()>();
+        tx.send(()).unwrap();
+        let output = block_on(unless_aborted(rx, pending_until_dropped(dropped.clone())));
+        assert_eq!(output, None);
+        assert!(
+            dropped.get(),
+            "the interrupted operation, and the stream it owns, is dropped"
+        );
+    }
+
+    #[test]
+    fn an_abort_wins_over_an_operation_ready_in_the_same_wakeup() {
+        assert_eq!(block_on(unless_aborted(ready(()), ready(7))), None);
+    }
+}
