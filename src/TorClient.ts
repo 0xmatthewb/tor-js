@@ -124,7 +124,14 @@ export class TorClient {
     if (this.closed) throw new Error('TorClient is closed');
     const client = await this.clientPromise;
     await this.ready();
-    this.log.info(`Fetching ${url}`);
+    // Log only the origin: the full URL can carry credentials or API keys.
+    let origin: string;
+    try {
+      origin = new URL(url).origin;
+    } catch {
+      origin = '(invalid URL)';
+    }
+    this.log.info(`Fetching ${origin}`);
     return client.fetch(url, init);
   }
 
