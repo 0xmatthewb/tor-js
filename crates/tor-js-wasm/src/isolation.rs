@@ -4,12 +4,19 @@
 //! made seconds apart leave the same exit and can be linked by whoever answers
 //! them. A caller that passes `anonOptions.isolationKey` gets one Arti
 //! isolation group per distinct key: requests with the same key may share
-//! circuits; requests with different keys never do.
+//! circuits; requests with different keys never do. Requests without a key
+//! form one more group of their own.
 //!
 //! The key is the caller's opaque label (an anon-rpc host might derive it from
 //! the account a request is about). It is never logged or sent anywhere.
+//!
+//! A group can also move to a fresh token. Arti keeps handing out a circuit
+//! whose exit failed to open a stream until the circuit expires, so `fetch`
+//! moves the group off it after such a failure (see `connect_in_group`).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use arti_client::IsolationToken;
 
@@ -28,9 +35,19 @@ pub(crate) enum KeyError {
 }
 
 /// Maps isolation keys to Arti isolation groups for one client.
-#[derive(Default)]
 pub(crate) struct IsolationGroups {
+    /// The group of requests made without a key.
+    unkeyed: IsolationToken,
     groups: HashMap<String, IsolationToken>,
+}
+
+impl Default for IsolationGroups {
+    fn default() -> Self {
+        Self {
+            unkeyed: IsolationToken::new(),
+            groups: HashMap::new(),
+        }
+    }
 }
 
 impl IsolationGroups {
@@ -47,12 +64,86 @@ impl IsolationGroups {
         if let Some(token) = self.groups.get(key) {
             return Ok(*token);
         }
+        Ok(self.insert_fresh(key))
+    }
+
+    /// The isolation group of requests made without a key.
+    pub(crate) fn unkeyed(&self) -> IsolationToken {
+        self.unkeyed
+    }
+
+    /// Move the group of `key` (the unkeyed group for `None`) off `stale` to a
+    /// fresh token, and return the group's token.
+    ///
+    /// Requests that failed together on one circuit all report the same
+    /// `stale` token; only the first moves the group, and the rest retry on the
+    /// token it chose instead of each building a circuit of its own.
+    pub(crate) fn replace(&mut self, key: Option<&str>, stale: IsolationToken) -> IsolationToken {
+        let current = match key {
+            None => &mut self.unkeyed,
+            Some(key) => match self.groups.get_mut(key) {
+                Some(token) => token,
+                // Forgotten since the request started: it gets a fresh group anyway.
+                None => return self.insert_fresh(key),
+            },
+        };
+        if *current == stale {
+            *current = IsolationToken::new();
+        }
+        *current
+    }
+
+    fn insert_fresh(&mut self, key: &str) -> IsolationToken {
         if self.groups.len() >= MAX_KEYS {
             self.groups.clear();
         }
         let token = IsolationToken::new();
         self.groups.insert(key.to_owned(), token);
-        Ok(token)
+        token
+    }
+}
+
+/// One request's isolation group: its token, and the means to move the group
+/// to a fresh one.
+pub(crate) struct Group {
+    groups: Rc<RefCell<IsolationGroups>>,
+    key: Option<String>,
+    token: IsolationToken,
+}
+
+impl Group {
+    /// The group for a request with `key`, or the unkeyed group for `None`.
+    pub(crate) fn new(
+        groups: &Rc<RefCell<IsolationGroups>>,
+        key: Option<String>,
+    ) -> Result<Self, KeyError> {
+        let token = match &key {
+            Some(key) => groups.borrow_mut().token_for(key)?,
+            None => groups.borrow().unkeyed(),
+        };
+        Ok(Self {
+            groups: Rc::clone(groups),
+            key,
+            token,
+        })
+    }
+
+    pub(crate) fn token(&self) -> IsolationToken {
+        self.token
+    }
+
+    pub(crate) fn is_keyed(&self) -> bool {
+        self.key.is_some()
+    }
+
+    /// Move the group off its current token (see [`IsolationGroups::replace`]),
+    /// so this request's retry and requests that start later get a circuit
+    /// other than the one this request failed on.
+    pub(crate) fn move_to_fresh_token(&mut self) {
+        self.token = self
+            .groups
+            .borrow_mut()
+            .replace(self.key.as_deref(), self.token);
     }
 }
 
@@ -100,5 +191,59 @@ mod tests {
             first, again,
             "a forgotten key gets a fresh group, never another key's"
         );
+    }
+
+    #[test]
+    fn unkeyed_requests_share_a_group_of_their_own() {
+        let mut groups = IsolationGroups::default();
+        let k = groups.token_for("k").unwrap();
+        assert_eq!(groups.unkeyed(), groups.unkeyed());
+        assert_ne!(groups.unkeyed(), k);
+    }
+
+    #[test]
+    fn replace_moves_a_group_once_per_stale_token() {
+        let mut groups = IsolationGroups::default();
+        let stale = groups.token_for("k").unwrap();
+        let fresh = groups.replace(Some("k"), stale);
+        assert_ne!(fresh, stale);
+        assert_eq!(groups.token_for("k").unwrap(), fresh);
+        // A second request that failed on the same circuit joins the first.
+        assert_eq!(groups.replace(Some("k"), stale), fresh);
+
+        let stale = groups.unkeyed();
+        let fresh = groups.replace(None, stale);
+        assert_ne!(fresh, stale);
+        assert_eq!(groups.unkeyed(), fresh);
+        assert_eq!(groups.replace(None, stale), fresh);
+    }
+
+    #[test]
+    fn replace_leaves_other_groups_alone() {
+        let mut groups = IsolationGroups::default();
+        let a = groups.token_for("a").unwrap();
+        let unkeyed = groups.unkeyed();
+        let b = groups.token_for("b").unwrap();
+        groups.replace(Some("b"), b);
+        assert_eq!(groups.token_for("a").unwrap(), a);
+        assert_eq!(groups.unkeyed(), unkeyed);
+    }
+
+    #[test]
+    fn group_handle_moves_the_shared_group() {
+        let groups = Rc::new(RefCell::new(IsolationGroups::default()));
+        let mut first = Group::new(&groups, Some("k".into())).unwrap();
+        let second = Group::new(&groups, Some("k".into())).unwrap();
+        assert_eq!(first.token(), second.token());
+        first.move_to_fresh_token();
+        assert_ne!(first.token(), second.token());
+        assert_eq!(
+            Group::new(&groups, Some("k".into())).unwrap().token(),
+            first.token()
+        );
+        assert!(matches!(
+            Group::new(&groups, Some(String::new())),
+            Err(KeyError::Empty)
+        ));
     }
 }

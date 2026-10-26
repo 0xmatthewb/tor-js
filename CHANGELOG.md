@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-One addition and two fixes. The WASM changes, so the anon-rpc worker's keccak256
-pin changes too.
+One addition and three fixes. The WASM changes, so the anon-rpc worker's
+keccak256 pin changes too.
 
 ### Added
 
@@ -22,6 +22,15 @@ pin changes too.
 
 ### Fixes
 
+- **One bad exit could fail every request in a group for up to ten minutes.**
+  Arti keeps giving out a circuit after its exit fails to open a stream on it,
+  until the circuit expires, so every request in that circuit's isolation group
+  (all requests without a key, say) timed out at the exit or was refused. When
+  the exit times out or answers with an END reason that C tor retries, `fetch`
+  now moves the request's group to a fresh circuit and tries once more, and
+  requests that start later stay off the failing circuit. Such a request can
+  wait out two 10 s stream-open timeouts, on top of building circuits, before
+  it fails.
 - **Connection errors now give the cause.** A stream the exit refused failed
   with only "Protocol error while launching a data stream". The message now
   also carries the underlying cause, such as the END reason the exit sent.

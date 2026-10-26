@@ -122,6 +122,13 @@ By default all requests may share Tor circuits. Pass `anonOptions.isolationKey`
 to keep requests apart: requests with different keys never share a circuit;
 requests with the same key may share one. Separate circuits choose their exits
 independently, so two keys can still leave through the same exit by chance.
+Requests without a key form one more group of their own.
+
+If an exit fails to open a stream (it times out, or refuses for a reason other
+than the destination refusing the connection), `fetch` moves that request's
+group to a fresh circuit and retries once, so one bad exit does not fail the
+group's requests until its circuit expires. A key's requests can therefore
+leave through more than one exit over time.
 
 ```js
 // Two accounts, kept on separate circuits:

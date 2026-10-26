@@ -46,11 +46,12 @@ use error::JsTorError;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arti_client::config::CfgPath;
-use arti_client::{IsolationToken, StreamPrefs, TorClient as ArtiTorClient, TorClientConfig};
-use isolation::{IsolationGroups, KeyError, MAX_KEY_LEN};
+use arti_client::{DataStream, HasKind, StreamPrefs, TorClient as ArtiTorClient, TorClientConfig};
+use isolation::{Group, IsolationGroups, KeyError, MAX_KEY_LEN};
 use serde::Deserialize;
 use crate::runtime::WasmRuntime;
 use tracing::{debug, info, error};
@@ -294,7 +295,7 @@ pub struct TorClient {
     inner: Option<Arc<ArtiTorClient<WasmRuntime>>>,
     tls: tls::TlsConfigs,
     /// `anonOptions.isolationKey` → Arti isolation group (see isolation.rs).
-    isolation: RefCell<IsolationGroups>,
+    isolation: Rc<RefCell<IsolationGroups>>,
 }
 
 #[wasm_bindgen]
@@ -329,10 +330,10 @@ impl TorClient {
         };
 
         // Resolve the isolation group now: the map lives on this client, and the
-        // future below must not borrow `self`.
-        let isolation = match isolation_key_from_init(&init) {
-            Ok(Some(key)) => match self.isolation.borrow_mut().token_for(&key) {
-                Ok(token) => Some(token),
+        // future below must not borrow `self`, so the group holds it by `Rc`.
+        let group = match isolation_key_from_init(&init) {
+            Ok(key) => match Group::new(&self.isolation, key) {
+                Ok(group) => group,
                 Err(e) => {
                     let message = match e {
                         KeyError::Empty => "anonOptions.isolationKey must not be empty".to_string(),
@@ -343,13 +344,12 @@ impl TorClient {
                     });
                 }
             },
-            Ok(None) => None,
             Err(e) => return wasm_bindgen_futures::future_to_promise(async move { Err(e) }),
         };
 
-        let tls_config = self.tls.for_request(isolation.is_some());
+        let tls_config = self.tls.for_request(group.is_keyed());
         wasm_bindgen_futures::future_to_promise(async move {
-            fetch_impl(&client, &url, init, tls_config, isolation).await
+            fetch_impl(&client, &url, init, tls_config, group).await
         })
     }
 
@@ -463,7 +463,7 @@ async fn create_client(options: TorClientOptions) -> Result<TorClient, JsValue> 
     Ok(TorClient {
         inner: Some(tor_client),
         tls: tls::TlsConfigs::new(make_tls_config()),
-        isolation: RefCell::new(IsolationGroups::default()),
+        isolation: Rc::new(RefCell::new(IsolationGroups::default())),
     })
 }
 
@@ -509,7 +509,7 @@ async fn fetch_impl(
     url_str: &str,
     init: JsValue,
     tls_config: Arc<futures_rustls::rustls::ClientConfig>,
-    isolation: Option<IsolationToken>,
+    mut group: Group,
 ) -> Result<JsValue, JsValue> {
     // Parse URL
     let url = url::Url::parse(url_str)
@@ -570,15 +570,7 @@ async fn fetch_impl(
 
     // Connect through Tor
     debug!("Connecting to {}:{}...", host, port);
-    let stream = match isolation {
-        Some(token) => {
-            let mut prefs = StreamPrefs::new();
-            prefs.set_isolation(token);
-            client.connect_with_prefs((host, port), &prefs).await
-        }
-        None => client.connect((host, port)).await,
-    }
-    .map_err(|e| JsTorError::connection(format!("Failed to connect: {}", error::with_sources(&e))).into_js_value())?;
+    let stream = connect_in_group(client, host, port, &mut group, signal.as_ref()).await?;
 
     // Check abort before sending the HTTP request
     check_aborted(signal.as_ref())?;
@@ -686,6 +678,75 @@ fn extract_body_from_js(init: &JsValue) -> Result<fetch::RequestBody, JsValue> {
         false,
     )
     .into_js_value())
+}
+
+/// Open a stream to `host:port` on a circuit of `group`.
+///
+/// Arti keeps giving out a circuit after a stream failed to open on it, until
+/// the circuit expires (ten minutes after first use for a shared one), so one
+/// bad exit can fail every request in a group for that long. Each time the far
+/// end fails to open the stream, move the group to a fresh token, so requests
+/// that start later get another circuit, and try once more after the first
+/// failure. This approximates C tor's `mark_circuit_unusable_for_new_conns`:
+/// requests that already hold the old token can still reach the old circuit,
+/// which expires on its own schedule.
+async fn connect_in_group(
+    client: &ArtiTorClient<WasmRuntime>,
+    host: &str,
+    port: u16,
+    group: &mut Group,
+    signal: Option<&web_sys::AbortSignal>,
+) -> Result<DataStream, JsValue> {
+    let connect = |token| {
+        let mut prefs = StreamPrefs::new();
+        prefs.set_isolation(token);
+        async move { client.connect_with_prefs((host, port), &prefs).await }
+    };
+    let failed = |e: arti_client::Error| {
+        JsTorError::connection(format!("Failed to connect: {}", error::with_sources(&e)))
+            .into_js_value()
+    };
+
+    let mut retried = false;
+    loop {
+        match connect(group.token()).await {
+            Err(e) if exit_failed(e.kind()) => {
+                group.move_to_fresh_token();
+                if retried {
+                    return Err(failed(e));
+                }
+                info!(
+                    "Exit failed to open a stream ({}); retrying on a fresh circuit",
+                    error::with_sources(&e)
+                );
+                check_aborted(signal)?;
+                retried = true;
+            }
+            result => return result.map_err(failed),
+        }
+    }
+}
+
+/// Whether an error of `kind` says the far end of the circuit failed to open
+/// a stream: it timed out (an exit, or an onion service's rendezvous), or the
+/// exit answered with an END reason that C tor retries on another circuit. A
+/// refused connection is the destination's answer, not the exit's, so it is
+/// not retried.
+fn exit_failed(kind: arti_client::ErrorKind) -> bool {
+    use arti_client::ErrorKind as EK;
+    matches!(
+        kind,
+        // Arti's own connect timeout; it reports this kind, not `ExitTimeout`.
+        EK::RemoteNetworkTimeout
+            // END reasons TIMEOUT, MISC, RESOLVEFAILED, NOROUTE, EXITPOLICY,
+            // and HIBERNATING or RESOURCELIMIT.
+            | EK::ExitTimeout
+            | EK::RemoteStreamError
+            | EK::RemoteHostResolutionFailed
+            | EK::RemoteNetworkFailed
+            | EK::ExitPolicyRejected
+            | EK::RelayTooBusy
+    )
 }
 
 /// Read `anonOptions.isolationKey` from a JavaScript FetchInit object, if present.
@@ -859,3 +920,18 @@ export interface TorClientOptions {
     withStorage(storage: TorStorage): TorClientOptions;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arti_client::ErrorKind as EK;
+
+    #[test]
+    fn exit_side_failures_are_retried_and_refusals_are_not() {
+        // Arti's connect timeout reports RemoteNetworkTimeout, not ExitTimeout.
+        assert!(exit_failed(EK::RemoteNetworkTimeout));
+        assert!(exit_failed(EK::RemoteStreamError));
+        assert!(!exit_failed(EK::RemoteConnectionRefused));
+        assert!(!exit_failed(EK::TorNetworkTimeout));
+    }
+}
