@@ -537,7 +537,8 @@ async fn fetch_impl(
         .ok_or_else(|| JsTorError::new("INVALID_URL", "validation", "No port in URL", false).into_js_value())?;
     let is_https = url.scheme() == "https";
 
-    info!("Fetching {} via Tor ({}:{})", url, host, port);
+    // Log only the origin: the full URL can carry credentials or API keys.
+    info!("Fetching {}://{}:{} via Tor", url.scheme(), host, port);
 
     // Connect through Tor (circuit building can take several seconds)
     debug!("Connecting to {}:{}...", host, port);

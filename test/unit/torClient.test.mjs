@@ -278,6 +278,16 @@ describe('TorClient', () => {
     client.close()
   })
 
+  test('fetch() logs only the origin of the URL', async () => {
+    const lines = []
+    const log = new Log({ rawLog: (_level, ...args) => lines.push(args.join(' ')) })
+    const client = makeClient({ log })
+    await client.fetch('https://user:pass@rpc.example.com:8545/v3/apikey?token=t#frag')
+    assert.ok(lines.some((l) => l.endsWith(' Fetching https://rpc.example.com:8545')))
+    assert.ok(!lines.some((l) => /user|pass|apikey|token|frag/.test(l)))
+    client.close()
+  })
+
   test('fetch() surfaces a bootstrap failure', async () => {
     stub.failCreate = true
     const client = makeClient()

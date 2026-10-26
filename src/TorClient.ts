@@ -129,7 +129,14 @@ export class TorClient {
     if (signal?.aborted) throw abortError();
     await abortRace(this.ready(), signal, abortError);
     const client = await this.clientPromise;
-    this.log.info(`Fetching ${url}`);
+    // Log only the origin: the full URL can carry credentials or API keys.
+    let origin: string;
+    try {
+      origin = new URL(url).origin;
+    } catch {
+      origin = '(invalid URL)';
+    }
+    this.log.info(`Fetching ${origin}`);
     return client.fetch(url, init);
   }
 
